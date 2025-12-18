@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <process.h>
+#include "vmaware.hpp"
 
 #ifndef NT_SUCCESS
     #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -7,7 +8,12 @@
 
 #define STATUS_SUCCESS                   ((NTSTATUS)0x00000000L)
 
-extern "C" {
+#pragma warning(disable: 4222)      // for 'DllInitialize' ordinal
+
+//============================================================================
+
+extern "C"
+{
     UINT_PTR pAlphaBlend = 0;
     UINT_PTR pDllInitialize = 0;
     UINT_PTR pGradientFill = 0;
@@ -15,14 +21,76 @@ extern "C" {
     UINT_PTR pvSetDdrawflag = 0;
 }
 
+enum VM_Techniques : uint64_t
+{
+    // --- Windows Specific ---
+    GPU_CAPABILITIES        = (1ULL << 0),
+    ACPI_SIGNATURE          = (1ULL << 1),
+    POWER_CAPABILITIES      = (1ULL << 2),
+    DISK_SERIAL             = (1ULL << 3),
+    IVSHMEM                 = (1ULL << 4),
+    SGDT                    = (1ULL << 5),
+    SLDT                    = (1ULL << 6),
+    SMSW                    = (1ULL << 7),
+    DRIVERS                 = (1ULL << 8),
+    DEVICE_HANDLES          = (1ULL << 9),
+    VIRTUAL_PROCESSORS      = (1ULL << 10),
+    HYPERVISOR_QUERY        = (1ULL << 11),
+    AUDIO                   = (1ULL << 12),
+    DISPLAY                 = (1ULL << 13),
+    DLL                     = (1ULL << 14),
+    VMWARE_BACKDOOR         = (1ULL << 15),
+    WINE                    = (1ULL << 16),
+    VIRTUAL_REGISTRY        = (1ULL << 17),
+    MUTEX                   = (1ULL << 18),
+    DEVICE_STRING           = (1ULL << 19),
+    VPC_INVALID             = (1ULL << 20),
+    VMWARE_STR              = (1ULL << 21),
+    GAMARUE                 = (1ULL << 22),
+    CUCKOO_DIR              = (1ULL << 23),
+    CUCKOO_PIPE             = (1ULL << 24),
+    BOOT_LOGO               = (1ULL << 25),
+    TRAP                    = (1ULL << 26),
+    UD                      = (1ULL << 27),
+    BLOCKSTEP               = (1ULL << 28),
+    DBVM                    = (1ULL << 29),
+    OBJECTS                 = (1ULL << 30),
+    NVRAM                   = (1ULL << 31),
+    SMBIOS_INTEGRITY        = (1ULL << 32),
+    EDID                    = (1ULL << 33),
+    CPU_HEURISTIC           = (1ULL << 34),
+    CLOCK                   = (1ULL << 35),
+
+    // --- Linux and Windows ---
+    SIDT                    = (1ULL << 36),
+    FIRMWARE                = (1ULL << 37),
+    PCI_DEVICES             = (1ULL << 38),
+    AZURE                   = (1ULL << 39),
+
+    // --- Cross-Platform / CPU Related ---
+    HYPERVISOR_BIT          = (1ULL << 40),
+    VMID                    = (1ULL << 41),
+    INTEL_THREAD_MISMATCH   = (1ULL << 42),
+    AMD_THREAD_MISMATCH     = (1ULL << 43),
+    XEON_THREAD_MISMATCH    = (1ULL << 44),
+    TIMER                   = (1ULL << 45),
+    CPU_BRAND               = (1ULL << 46),
+    HYPERVISOR_STR          = (1ULL << 47),
+    CPUID_SIGNATURE         = (1ULL << 48),
+    BOCHS_CPU               = (1ULL << 49),
+    KGT_SIGNATURE           = (1ULL << 50),
+};
+
+//============================================================================
 
 typedef HMODULE(WINAPI* pfnLoadLibraryA)(LPCSTR lpLibFileName);
+
 pfnLoadLibraryA pLoadLibraryA = &LoadLibraryA;
 
 
 //============================================================================
 
-__declspec(noinline) bool __stdcall isSame(const char* a, const char* b)
+__declspec(noinline) bool static __stdcall isSame(const char* a, const char* b)
 {
     while(*a && *b)
     {
@@ -268,8 +336,8 @@ void static SetupProxies()
         //pTransparentBlt = (UINT_PTR)GetProcAddress(hReal, "TransparentBlt");
         //pvSetDdrawflag  = (UINT_PTR)GetProcAddress(hReal, "vSetDdrawflag");
 
-        pAlphaBlend = (UINT_PTR)ShellcodeFindExportAddress(hReal, "AlphaBlend", pLoadLibraryA);
-        pDllInitialize = (UINT_PTR)ShellcodeFindExportAddress(hReal, "DllInitialize", pLoadLibraryA);
+        pAlphaBlend     = (UINT_PTR)ShellcodeFindExportAddress(hReal, "AlphaBlend", pLoadLibraryA);
+        pDllInitialize  = (UINT_PTR)ShellcodeFindExportAddress(hReal, "DllInitialize", pLoadLibraryA);
         pGradientFill   = (UINT_PTR)ShellcodeFindExportAddress(hReal, "GradientFill", pLoadLibraryA);
         pTransparentBlt = (UINT_PTR)ShellcodeFindExportAddress(hReal, "TransparentBlt", pLoadLibraryA);
         pvSetDdrawflag  = (UINT_PTR)ShellcodeFindExportAddress(hReal, "vSetDdrawflag", pLoadLibraryA);
@@ -277,16 +345,154 @@ void static SetupProxies()
     }
 }
 
-NTSTATUS static checkVM()
+void static ShowDetectionReport(uint64_t mask)
 {
+    std::stringstream ss;
+    ss << "--- VM Detection Report ---\n";
+    ss << "Raw Mask: 0x" << std::hex << mask << std::dec << "\n\n";
 
+    if(mask == 0)  ss << "  [OK] No virtualization techniques detected.\n";
+    else
+    {
 
-    return STATUS_SUCCESS;
+// Helper macro to append to stringstream
+#define CHECK_APPEND(flag_name) \
+if(mask & VM_Techniques::flag_name) \
+ss << "  [!] Detected: " #flag_name << "\n"
+
+        // --- Windows Specific ---
+        CHECK_APPEND(GPU_CAPABILITIES);
+        CHECK_APPEND(ACPI_SIGNATURE);
+        CHECK_APPEND(POWER_CAPABILITIES);
+        CHECK_APPEND(DISK_SERIAL);
+        CHECK_APPEND(IVSHMEM);
+        CHECK_APPEND(SGDT);
+        CHECK_APPEND(SLDT);
+        CHECK_APPEND(SMSW);
+        CHECK_APPEND(DRIVERS);
+        CHECK_APPEND(DEVICE_HANDLES);
+        CHECK_APPEND(VIRTUAL_PROCESSORS);
+        CHECK_APPEND(HYPERVISOR_QUERY);
+        CHECK_APPEND(AUDIO);
+        CHECK_APPEND(DISPLAY);
+        CHECK_APPEND(DLL);
+        CHECK_APPEND(VMWARE_BACKDOOR);
+        CHECK_APPEND(WINE);
+        CHECK_APPEND(VIRTUAL_REGISTRY);
+        CHECK_APPEND(MUTEX);
+        CHECK_APPEND(DEVICE_STRING);
+        CHECK_APPEND(VPC_INVALID);
+        CHECK_APPEND(VMWARE_STR);
+        CHECK_APPEND(GAMARUE);
+        CHECK_APPEND(CUCKOO_DIR);
+        CHECK_APPEND(CUCKOO_PIPE);
+        CHECK_APPEND(BOOT_LOGO);
+        CHECK_APPEND(TRAP);
+        CHECK_APPEND(UD);
+        CHECK_APPEND(BLOCKSTEP);
+        CHECK_APPEND(DBVM);
+        CHECK_APPEND(OBJECTS);
+        CHECK_APPEND(NVRAM);
+        CHECK_APPEND(SMBIOS_INTEGRITY);
+        CHECK_APPEND(EDID);
+        CHECK_APPEND(CPU_HEURISTIC);
+        CHECK_APPEND(CLOCK);
+
+        // --- Linux and Windows ---
+        CHECK_APPEND(SIDT);
+        CHECK_APPEND(FIRMWARE);
+        CHECK_APPEND(PCI_DEVICES);
+        CHECK_APPEND(AZURE);
+
+        // --- Cross-Platform / CPU Related ---
+        CHECK_APPEND(HYPERVISOR_BIT);
+        CHECK_APPEND(VMID);
+        CHECK_APPEND(INTEL_THREAD_MISMATCH);
+        CHECK_APPEND(AMD_THREAD_MISMATCH);
+        CHECK_APPEND(XEON_THREAD_MISMATCH);
+        CHECK_APPEND(TIMER);
+        CHECK_APPEND(CPU_BRAND);
+        CHECK_APPEND(HYPERVISOR_STR);
+        CHECK_APPEND(CPUID_SIGNATURE);
+        CHECK_APPEND(BOCHS_CPU);
+        CHECK_APPEND(KGT_SIGNATURE);
+
+#undef CHECK_APPEND
+    }
+
+    MessageBoxA(NULL, ss.str().c_str(), "Detection Results", MB_OK | MB_ICONWARNING);
 }
 
-unsigned __stdcall PayloadThread(void* pArguments)
+void static checkVM()
+{
+
+    uint64_t mask = 0;
+    // --- Windows Specific ---
+    if(VM::check(VM::GPU_CAPABILITIES))      mask |= VM_Techniques::GPU_CAPABILITIES;
+    if(VM::check(VM::ACPI_SIGNATURE))        mask |= VM_Techniques::ACPI_SIGNATURE;
+    if(VM::check(VM::POWER_CAPABILITIES))    mask |= VM_Techniques::POWER_CAPABILITIES;
+    if(VM::check(VM::DISK_SERIAL))           mask |= VM_Techniques::DISK_SERIAL;
+    if(VM::check(VM::IVSHMEM))               mask |= VM_Techniques::IVSHMEM;
+    if(VM::check(VM::SGDT))                  mask |= VM_Techniques::SGDT;
+    if(VM::check(VM::SLDT))                  mask |= VM_Techniques::SLDT;
+    if(VM::check(VM::SMSW))                  mask |= VM_Techniques::SMSW;
+    if(VM::check(VM::DRIVERS))               mask |= VM_Techniques::DRIVERS;
+    if(VM::check(VM::DEVICE_HANDLES))        mask |= VM_Techniques::DEVICE_HANDLES;
+    if(VM::check(VM::VIRTUAL_PROCESSORS))    mask |= VM_Techniques::VIRTUAL_PROCESSORS;
+    if(VM::check(VM::HYPERVISOR_QUERY))      mask |= VM_Techniques::HYPERVISOR_QUERY;
+    if(VM::check(VM::AUDIO))                 mask |= VM_Techniques::AUDIO;
+    if(VM::check(VM::DISPLAY))               mask |= VM_Techniques::DISPLAY;
+    if(VM::check(VM::DLL))                   mask |= VM_Techniques::DLL;
+    if(VM::check(VM::VMWARE_BACKDOOR))       mask |= VM_Techniques::VMWARE_BACKDOOR;
+    if(VM::check(VM::WINE))                  mask |= VM_Techniques::WINE;
+    if(VM::check(VM::VIRTUAL_REGISTRY))      mask |= VM_Techniques::VIRTUAL_REGISTRY;
+    if(VM::check(VM::MUTEX))                 mask |= VM_Techniques::MUTEX;
+    if(VM::check(VM::DEVICE_STRING))         mask |= VM_Techniques::DEVICE_STRING;
+    if(VM::check(VM::VPC_INVALID))           mask |= VM_Techniques::VPC_INVALID;
+    if(VM::check(VM::VMWARE_STR))            mask |= VM_Techniques::VMWARE_STR;
+    if(VM::check(VM::GAMARUE))               mask |= VM_Techniques::GAMARUE;
+    if(VM::check(VM::CUCKOO_DIR))            mask |= VM_Techniques::CUCKOO_DIR;
+    if(VM::check(VM::CUCKOO_PIPE))           mask |= VM_Techniques::CUCKOO_PIPE;
+    if(VM::check(VM::BOOT_LOGO))             mask |= VM_Techniques::BOOT_LOGO;
+    if(VM::check(VM::TRAP))                  mask |= VM_Techniques::TRAP;
+    if(VM::check(VM::UD))                    mask |= VM_Techniques::UD;
+    if(VM::check(VM::BLOCKSTEP))             mask |= VM_Techniques::BLOCKSTEP;
+    if(VM::check(VM::DBVM))                  mask |= VM_Techniques::DBVM;
+    if(VM::check(VM::OBJECTS))               mask |= VM_Techniques::OBJECTS;
+    if(VM::check(VM::NVRAM))                 mask |= VM_Techniques::NVRAM;
+    if(VM::check(VM::SMBIOS_INTEGRITY))      mask |= VM_Techniques::SMBIOS_INTEGRITY;
+    if(VM::check(VM::EDID))                  mask |= VM_Techniques::EDID;
+    if(VM::check(VM::CPU_HEURISTIC))         mask |= VM_Techniques::CPU_HEURISTIC;
+    if(VM::check(VM::CLOCK))                 mask |= VM_Techniques::CLOCK;
+
+    // --- Linux and Windows ---
+    if(VM::check(VM::SIDT))                  mask |= VM_Techniques::SIDT;
+    if(VM::check(VM::FIRMWARE))              mask |= VM_Techniques::FIRMWARE;
+    if(VM::check(VM::PCI_DEVICES))           mask |= VM_Techniques::PCI_DEVICES;
+    if(VM::check(VM::AZURE))                 mask |= VM_Techniques::AZURE;
+
+    // --- Cross-Platform / CPU Related ---
+    if(VM::check(VM::HYPERVISOR_BIT))        mask |= VM_Techniques::HYPERVISOR_BIT;
+    if(VM::check(VM::VMID))                  mask |= VM_Techniques::VMID;
+    if(VM::check(VM::INTEL_THREAD_MISMATCH)) mask |= VM_Techniques::INTEL_THREAD_MISMATCH;
+    if(VM::check(VM::AMD_THREAD_MISMATCH))   mask |= VM_Techniques::AMD_THREAD_MISMATCH;
+    if(VM::check(VM::XEON_THREAD_MISMATCH))  mask |= VM_Techniques::XEON_THREAD_MISMATCH;
+    if(VM::check(VM::TIMER))                 mask |= VM_Techniques::TIMER;
+    if(VM::check(VM::CPU_BRAND))             mask |= VM_Techniques::CPU_BRAND;
+    if(VM::check(VM::HYPERVISOR_STR))        mask |= VM_Techniques::HYPERVISOR_STR;
+    if(VM::check(VM::CPUID_SIGNATURE))       mask |= VM_Techniques::CPUID_SIGNATURE;
+    if(VM::check(VM::BOCHS_CPU))             mask |= VM_Techniques::BOCHS_CPU;
+    if(VM::check(VM::KGT_SIGNATURE))         mask |= VM_Techniques::KGT_SIGNATURE;
+
+    ShowDetectionReport(mask);
+
+}
+
+unsigned static __stdcall PayloadThread(void* pArguments)
 {
     Sleep(1000);
+
+    // ----------------------
 
     BOOL fRet = FALSE;
     HANDLE hToken = NULL;
@@ -304,20 +510,16 @@ unsigned __stdcall PayloadThread(void* pArguments)
     if(fRet) MessageBoxA(NULL, "PayloadThread Started with Admin privilages", "Notification", MB_OK);
     else MessageBoxA(NULL, "PayloadThread Started without Admin privilages", "Notification", MB_OK);
     
+    // ----------------------
 
-    if(!NT_SUCCESS(checkVM()))
-    {
-        MessageBoxA(NULL, "VM is Detected", "Notification", MB_OK);
-        return 0;
-    }
+    checkVM();
 
-    MessageBoxA(NULL, "No VM Detected", "Notification", MB_OK);
-
+    // ----------------------
 
     return 0;
 }
 
-BOOL static APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
 {
     switch (ul_reason_for_call)
     {
